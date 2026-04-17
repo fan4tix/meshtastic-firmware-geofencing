@@ -30,6 +30,9 @@
 #endif
 #if !MESHTASTIC_EXCLUDE_GPS
 #include "modules/PositionModule.h"
+#if !MESHTASTIC_EXCLUDE_GEOFENCING
+#include "modules/GeofenceModule.h"
+#endif
 #endif
 #if !MESHTASTIC_EXCLUDE_REMOTEHARDWARE
 #include "modules/RemoteHardwareModule.h"
@@ -139,6 +142,9 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_GPS
     positionModule = new PositionModule();
+#if !MESHTASTIC_EXCLUDE_GEOFENCING
+    geofenceModule = new GeofenceModule();
+#endif
 #endif
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
     waypointModule = new WaypointModule();
