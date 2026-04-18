@@ -9,7 +9,6 @@
 #include "MessageStore.h"
 #include "NodeDB.h"
 #include "buzz.h"
-#include "graphics/Screen.h"
 #include "graphics/SharedUIDisplay.h"
 #include "graphics/draw/MessageRenderer.h"
 #include "graphics/draw/UIRenderer.h"
@@ -22,6 +21,7 @@
 #include "modules/AdminModule.h"
 #include "modules/CannedMessageModule.h"
 #include "modules/ExternalNotificationModule.h"
+#include "modules/GeofenceModule.h"
 #include "modules/KeyVerificationModule.h"
 #include "modules/TraceRouteModule.h"
 #include <algorithm>
@@ -1110,6 +1110,91 @@ void menuHandler::systemBaseMenu()
             }
         }
     };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::geofenceMenu()
+{
+    enum optionsNumbers { Back, SelectTarget, SetRadius, ArmReset, Disarm, enumEnd };
+    static const char *optionsArray[enumEnd] = {"Back", "Select Target", "Set Radius", "Arm/Reset", "Disarm"};
+
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Geofence Action";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = enumEnd;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (!geofenceModule) {
+            return;
+        }
+
+        if (selected == SelectTarget) {
+            menuHandler::menuQueue = menuHandler::GeofenceTargetPickerMenu;
+            screen->runNow();
+        } else if (selected == SetRadius) {
+            menuHandler::menuQueue = menuHandler::GeofenceRadiusMenu;
+            screen->runNow();
+        } else if (selected == ArmReset) {
+            menuHandler::menuQueue = menuHandler::GeofenceArmResetMenu;
+            screen->runNow();
+        } else if (selected == Disarm) {
+            geofenceModule->disarmFromMenu();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::geofenceTargetPickerMenu()
+{
+    screen->showNodePicker("Geofence Target", 30000, [](uint32_t nodenum) -> void {
+        if (geofenceModule) {
+            geofenceModule->setTargetNode(nodenum);
+        }
+    });
+}
+
+void menuHandler::geofenceArmResetMenu()
+{
+    if (geofenceModule) {
+        geofenceModule->armOrReset();
+    }
+}
+
+void menuHandler::geofenceRadiusMenu()
+{
+    static const MenuOption<uint16_t> radiusOptions[] = {
+        {"Back", OptionsAction::Back},
+        {"25m", OptionsAction::Select, 25},
+        {"50m", OptionsAction::Select, 50},
+        {"100m", OptionsAction::Select, 100},
+        {"200m", OptionsAction::Select, 200},
+        {"500m", OptionsAction::Select, 500},
+    };
+    constexpr size_t radiusCount = sizeof(radiusOptions) / sizeof(radiusOptions[0]);
+    static std::array<const char *, radiusCount> radiusLabels{};
+
+    auto bannerOptions = createStaticBannerOptions("Set Radius", radiusOptions, radiusLabels,
+                                                   [](const MenuOption<uint16_t> &option, int) -> void {
+                                                       if (option.action == OptionsAction::Back) {
+                                                           menuHandler::menuQueue = menuHandler::GeofenceMenu;
+                                                           screen->runNow();
+                                                           return;
+                                                       }
+
+                                                       if (option.hasValue && geofenceModule) {
+                                                           geofenceModule->setRadiusMeters(option.value);
+                                                       }
+                                                   });
+
+    if (geofenceModule) {
+        const uint16_t currentRadius = geofenceModule->getRadiusMeters();
+        for (size_t index = 1; index < radiusCount; ++index) {
+            if (radiusOptions[index].hasValue && radiusOptions[index].value == currentRadius) {
+                bannerOptions.InitialSelected = static_cast<int8_t>(index);
+                break;
+            }
+        }
+    }
+
     screen->showOverlayBanner(bannerOptions);
 }
 
@@ -2750,6 +2835,18 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
         break;
     case TraceRouteMenu:
         traceRouteMenu();
+        break;
+    case GeofenceMenu:
+        geofenceMenu();
+        break;
+    case GeofenceTargetPickerMenu:
+        geofenceTargetPickerMenu();
+        break;
+    case GeofenceArmResetMenu:
+        geofenceArmResetMenu();
+        break;
+    case GeofenceRadiusMenu:
+        geofenceRadiusMenu();
         break;
     case TestMenu:
         testMenu();

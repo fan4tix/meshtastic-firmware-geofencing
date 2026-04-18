@@ -62,6 +62,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "mesh/Channels.h"
 #include "mesh/generated/meshtastic/deviceonly.pb.h"
 #include "modules/ExternalNotificationModule.h"
+#if !MESHTASTIC_EXCLUDE_GEOFENCING
+#include "modules/GeofenceModule.h"
+#endif
 #include "modules/TextMessageModule.h"
 #include "modules/WaypointModule.h"
 #include "sleep.h"
@@ -1177,6 +1180,10 @@ void Screen::setFrames(FrameFocus focus)
                 fsi.positions.focusedModule = numframes;
             if (m && m == waypointModule)
                 fsi.positions.waypoint = numframes;
+#if !MESHTASTIC_EXCLUDE_GEOFENCING
+            if (m && geofenceModule && geofenceModule->isModuleFrame(m))
+                fsi.positions.geofence = numframes;
+#endif
 
             indicatorIcons.push_back(icon_module);
             numframes++;
@@ -1819,6 +1826,10 @@ int Screen::handleInputEvent(const InputEvent *event)
                     menuHandler::nodeListMenu();
                 } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.wifi) {
                     menuHandler::wifiBaseMenu();
+#if !MESHTASTIC_EXCLUDE_GEOFENCING
+                } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.geofence) {
+                    menuHandler::geofenceMenu();
+#endif
                 }
             } else if (event->inputEvent == INPUT_BROKER_BACK) {
                 showFrame(FrameDirection::PREVIOUS);

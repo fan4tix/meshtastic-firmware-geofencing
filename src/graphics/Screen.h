@@ -681,6 +681,7 @@ class Screen : public concurrency::OSThread
         struct FramePositions {
             uint8_t fault = 255;
             uint8_t waypoint = 255;
+            uint8_t geofence = 255;
             uint8_t focusedModule = 255;
             uint8_t log = 255;
             uint8_t settings = 255;

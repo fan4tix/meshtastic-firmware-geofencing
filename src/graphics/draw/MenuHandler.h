@@ -47,6 +47,10 @@ class menuHandler
         KeyVerificationInit,
         KeyVerificationFinalPrompt,
         TraceRouteMenu,
+        GeofenceMenu,
+        GeofenceTargetPickerMenu,
+        GeofenceArmResetMenu,
+        GeofenceRadiusMenu,
         ThrottleMessage,
         MessageResponseMenu,
         MessageViewModeMenu,
@@ -100,6 +104,10 @@ class menuHandler
     static void addFavoriteMenu();
     static void removeFavoriteMenu();
     static void traceRouteMenu();
+    static void geofenceMenu();
+    static void geofenceTargetPickerMenu();
+    static void geofenceArmResetMenu();
+    static void geofenceRadiusMenu();
     static void testMenu();
     static void numberTest();
     static void wifiBaseMenu();

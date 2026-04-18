@@ -13,6 +13,7 @@ GeofenceModule *geofenceModule;
 namespace
 {
 constexpr uint32_t geofenceAlarmBeepIntervalMs = 1200;
+constexpr uint32_t geofenceArmMaxTargetAgeSeconds = 5 * 60;
 
 #if defined(USE_RF95) && defined(PIN_BUZZER) && (PIN_BUZZER == 19)
 constexpr bool geofenceBuzzerAllowed = false;
@@ -21,10 +22,7 @@ constexpr bool geofenceBuzzerAllowed = true;
 #endif
 
 const uint16_t radiusPresetsMeters[] = {25, 50, 100, 200, 500};
-
-#if HAS_SCREEN
-const char *mainMenuItems[] = {"Select target", "Set radius", "Arm/Reset", "Disarm", "Back"};
-#endif
+constexpr size_t radiusPresetCount = sizeof(radiusPresetsMeters) / sizeof(radiusPresetsMeters[0]);
 }
 
 const char *GeofenceModule::stateFilePath()
@@ -135,16 +133,20 @@ void GeofenceModule::updateMonitoringFromNodeDB()
 
     runtime.lastTargetPositionAgeSec = sinceLastSeen(targetNode);
 
-    // Check timeout condition only if armed
-    if (state.armed && state.timeoutSeconds > 0 && runtime.lastTargetPositionAgeSec > state.timeoutSeconds) {
+    // Offline alarm: target has not been seen for 5 minutes.
+    if (state.armed && runtime.lastTargetPositionAgeSec > geofenceArmMaxTargetAgeSeconds) {
         if (runtime.timeoutConsecutiveCount < UINT8_MAX) {
             runtime.timeoutConsecutiveCount++;
         }
         if (runtime.timeoutConsecutiveCount >= state.timeoutThreshold) {
-            triggerAlarm();
+            triggerAlarm(GeofenceModule::AlarmType::Offline);
         }
     } else {
         runtime.timeoutConsecutiveCount = 0;
+    }
+
+    if (runtime.lastTargetPositionAgeSec > geofenceArmMaxTargetAgeSeconds) {
+        return;
     }
 
     // Skip distance check if not armed
@@ -169,7 +171,7 @@ void GeofenceModule::updateMonitoringFromNodeDB()
             runtime.outsideConsecutiveCount++;
         }
         if (runtime.outsideConsecutiveCount >= state.outsideThreshold) {
-            triggerAlarm();
+            triggerAlarm(GeofenceModule::AlarmType::Geofence);
         }
     } else {
         runtime.outsideConsecutiveCount = 0;
@@ -207,17 +209,24 @@ void GeofenceModule::disarm()
     saveState(true);
 }
 
-void GeofenceModule::triggerAlarm()
+void GeofenceModule::triggerAlarm(AlarmType alarmType)
 {
+    // If user acknowledged/silenced the alarm, don't re-trigger until state changes
+    // (e.g. arm/reset clears alarmSilenced).
+    if (state.alarmSilenced) {
+        return;
+    }
+
     if (runtime.alarmActive) {
         return;
     }
 
     runtime.alarmActive = true;
+    runtime.alarmType = alarmType;
     runtime.lastAlarmBeepMs = 0;
 #if HAS_SCREEN
-    if (screen) {
-        screen->startAlert("Geofence Alarm");
+    if (screen && !state.alarmSilenced) {
+        screen->startAlert(alarmType == AlarmType::Offline ? "Offline Alarm" : "Geofence Alarm");
     }
 #endif
 }
@@ -225,6 +234,7 @@ void GeofenceModule::triggerAlarm()
 void GeofenceModule::clearAlarm(bool keepSilenced)
 {
     runtime.alarmActive = false;
+    runtime.alarmType = AlarmType::None;
     runtime.lastAlarmBeepMs = 0;
     if (!keepSilenced) {
         state.alarmSilenced = false;
@@ -277,78 +287,116 @@ void GeofenceModule::saveState(bool force)
 }
 
 #if HAS_SCREEN
-void GeofenceModule::setUiState(UiState nextState)
+void GeofenceModule::notifyScreenUpdate(UIFrameEvent::Action action, bool focusFrame)
 {
-    uiState = nextState;
-    menuScrollOffset = 0;
-    targetMenuScrollOffset = 0;
-    radiusMenuScrollOffset = 0;
-    
-    if (uiState == UI_STATE_MAIN_MENU) {
-        menuIndex = 0;
-    } else if (uiState == UI_STATE_TARGET_MENU) {
-        targetMenuIndex = 0;
-        rebuildTargetCandidates();
-    } else if (uiState == UI_STATE_RADIUS_MENU) {
-        targetMenuIndex = 0;
-        for (int i = 0; i < radiusPresetCount; ++i) {
-            if (radiusPresetsMeters[i] == state.radiusMeters) {
-                targetMenuIndex = i + 1;
-                break;
-            }
-        }
+    if (focusFrame) {
+        requestFocus();
     }
 
-    requestFocus();
     UIFrameEvent event;
-    event.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
+    event.action = action;
     notifyObservers(&event);
 }
 
-void GeofenceModule::rebuildTargetCandidates()
+void GeofenceModule::setTargetNode(uint32_t nodenum)
 {
-    targetCandidates.clear();
-    if (!nodeDB || !nodeDB->meshNodes) {
+    if (!nodenum || !nodeDB) {
         return;
     }
 
-    for (const auto &node : *nodeDB->meshNodes) {
-        if (node.num == 0 || node.num == nodeDB->getNodeNum() || !node.has_position || !nodeDB->hasValidPosition(&node)) {
-            continue;
+    meshtastic_NodeInfoLite *targetNode = nodeDB->getMeshNode(nodenum);
+    if (!targetNode) {
+        if (screen) {
+            screen->showSimpleBanner("Target not\nfound", 2000);
         }
-        targetCandidates.push_back(node.num);
+        return;
     }
 
-    if (targetCandidates.size() > 4) {
-        targetCandidates.resize(4);
+    state.targetNode = nodenum;
+
+    if (state.armed && (!nodeDB->hasValidPosition(targetNode) || sinceLastSeen(targetNode) > geofenceArmMaxTargetAgeSeconds)) {
+        disarm();
+        notifyScreenUpdate(UIFrameEvent::Action::REGENERATE_FRAMESET, true);
+        if (screen) {
+            screen->showSimpleBanner(!nodeDB->hasValidPosition(targetNode) ? "Geofence off\nno target GPS"
+                                                                           : "Geofence off\ntarget offline",
+                                     2500);
+        }
+        return;
     }
 
-    std::sort(targetCandidates.begin(), targetCandidates.end());
+    saveState(true);
+    notifyScreenUpdate(UIFrameEvent::Action::REGENERATE_FRAMESET, true);
+}
 
-    selectedNodeIndex = 0;
-    for (size_t i = 0; i < targetCandidates.size(); ++i) {
-        if (targetCandidates[i] == state.targetNode) {
-            selectedNodeIndex = static_cast<int>(i);
-            break;
+void GeofenceModule::setRadiusMeters(uint16_t meters)
+{
+    for (size_t index = 0; index < radiusPresetCount; ++index) {
+        if (radiusPresetsMeters[index] == meters) {
+            state.radiusMeters = meters;
+            saveState(true);
+            notifyScreenUpdate(UIFrameEvent::Action::REGENERATE_FRAMESET, true);
+            return;
         }
     }
 }
 
-bool GeofenceModule::isUpEvent(const InputEvent *event) const
+void GeofenceModule::armOrReset()
 {
-    return event->inputEvent == INPUT_BROKER_UP || event->inputEvent == INPUT_BROKER_ALT_PRESS ||
-           event->inputEvent == INPUT_BROKER_LEFT;
+    if (!state.targetNode) {
+        if (screen) {
+            screen->showSimpleBanner("Select target\nfirst", 2000);
+        }
+        return;
+    }
+
+    meshtastic_NodeInfoLite *targetNode = nodeDB ? nodeDB->getMeshNode(state.targetNode) : nullptr;
+    if (!targetNode) {
+        if (screen) {
+            screen->showSimpleBanner("Target not\nfound", 2000);
+        }
+        return;
+    }
+
+    if (!nodeDB->hasValidPosition(targetNode)) {
+        if (screen) {
+            screen->showSimpleBanner("Target has\nno position", 2000);
+        }
+        return;
+    }
+
+    if (sinceLastSeen(targetNode) > geofenceArmMaxTargetAgeSeconds) {
+        if (screen) {
+            screen->showSimpleBanner("Target stale\n(>5 min)", 2500);
+        }
+        return;
+    }
+
+    if (!refreshCenterFromTargetPosition()) {
+        if (screen) {
+            screen->showSimpleBanner("Target has\nno position", 2000);
+        }
+        return;
+    }
+
+    state.armed = true;
+    state.alarmSilenced = false;
+    runtime.timeoutConsecutiveCount = 0;
+    runtime.outsideConsecutiveCount = 0;
+    clearAlarm();
+    saveState(true);
+    notifyScreenUpdate(UIFrameEvent::Action::REGENERATE_FRAMESET, true);
 }
 
-bool GeofenceModule::isDownEvent(const InputEvent *event) const
+void GeofenceModule::disarmFromMenu()
 {
-    return event->inputEvent == INPUT_BROKER_DOWN || event->inputEvent == INPUT_BROKER_USER_PRESS ||
-           event->inputEvent == INPUT_BROKER_RIGHT;
+    disarm();
+    notifyScreenUpdate(UIFrameEvent::Action::REGENERATE_FRAMESET, true);
 }
 
-bool GeofenceModule::isSelectEvent(const InputEvent *event) const
+bool GeofenceModule::isModuleFrame(const MeshModule *module) const
 {
-    return event->inputEvent == INPUT_BROKER_SELECT;
+    return module == static_cast<const MeshModule *>(this);
 }
 
 static bool isAlarmAcknowledgeEvent(const InputEvent *event)
@@ -379,167 +427,15 @@ int GeofenceModule::handleInputEvent(const InputEvent *event)
     // Acknowledge/silence active alarm from the alert or status screen.
     if (runtime.alarmActive && isAlarmAcknowledgeEvent(event)) {
         state.alarmSilenced = true;
-        saveState();
-#if HAS_SCREEN
-        if (screen) {
-            screen->endAlert();
-        }
-#endif
-    UIFrameEvent uiEvent;
-    uiEvent.action = UIFrameEvent::Action::REDRAW_ONLY;
-    notifyObservers(&uiEvent);
-        return 1;
-    }
-
-    if (uiState == UI_STATE_STATUS) {
-        if (isSelectEvent(event)) {
-            setUiState(UI_STATE_MAIN_MENU);
-            return 1;
-        }
-        return 0;
-    }
-
-    if (isUpEvent(event)) {
-        if (uiState == UI_STATE_MAIN_MENU) {
-            menuIndex = (menuIndex - 1 + mainMenuCount) % mainMenuCount;
-            // Update scroll offset to keep selection visible
-            if (menuIndex < menuScrollOffset) {
-                menuScrollOffset = menuIndex;
-            } else if (menuIndex >= menuScrollOffset + maxVisibleMenuItems) {
-                menuScrollOffset = menuIndex - maxVisibleMenuItems + 1;
-            }
-        } else if (uiState == UI_STATE_TARGET_MENU) {
-            const int itemCount = static_cast<int>(targetCandidates.size()) + 1;
-            if (itemCount > 0) {
-                targetMenuIndex = (targetMenuIndex - 1 + itemCount) % itemCount;
-                if (targetMenuIndex < targetMenuScrollOffset) {
-                    targetMenuScrollOffset = targetMenuIndex;
-                } else if (targetMenuIndex >= targetMenuScrollOffset + maxVisibleMenuItems) {
-                    targetMenuScrollOffset = targetMenuIndex - maxVisibleMenuItems + 1;
-                }
-            }
-        } else if (uiState == UI_STATE_RADIUS_MENU) {
-            const int itemCount = radiusPresetCount + 1;
-            targetMenuIndex = (targetMenuIndex - 1 + itemCount) % itemCount;
-            if (targetMenuIndex < radiusMenuScrollOffset) {
-                radiusMenuScrollOffset = targetMenuIndex;
-            } else if (targetMenuIndex >= radiusMenuScrollOffset + maxVisibleMenuItems) {
-                radiusMenuScrollOffset = targetMenuIndex - maxVisibleMenuItems + 1;
-            }
-        }
-        UIFrameEvent uiEvent;
-        uiEvent.action = UIFrameEvent::Action::REDRAW_ONLY;
-        notifyObservers(&uiEvent);
-        return 1;
-    }
-
-    if (isDownEvent(event)) {
-        if (uiState == UI_STATE_MAIN_MENU) {
-            menuIndex = (menuIndex + 1) % mainMenuCount;
-            if (menuIndex < menuScrollOffset) {
-                menuScrollOffset = menuIndex;
-            } else if (menuIndex >= menuScrollOffset + maxVisibleMenuItems) {
-                menuScrollOffset = menuIndex - maxVisibleMenuItems + 1;
-            }
-        } else if (uiState == UI_STATE_TARGET_MENU) {
-            const int itemCount = static_cast<int>(targetCandidates.size()) + 1;
-            if (itemCount > 0) {
-                targetMenuIndex = (targetMenuIndex + 1) % itemCount;
-                if (targetMenuIndex < targetMenuScrollOffset) {
-                    targetMenuScrollOffset = targetMenuIndex;
-                } else if (targetMenuIndex >= targetMenuScrollOffset + maxVisibleMenuItems) {
-                    targetMenuScrollOffset = targetMenuIndex - maxVisibleMenuItems + 1;
-                }
-            }
-        } else if (uiState == UI_STATE_RADIUS_MENU) {
-            const int itemCount = radiusPresetCount + 1;
-            targetMenuIndex = (targetMenuIndex + 1) % itemCount;
-            if (targetMenuIndex < radiusMenuScrollOffset) {
-                radiusMenuScrollOffset = targetMenuIndex;
-            } else if (targetMenuIndex >= radiusMenuScrollOffset + maxVisibleMenuItems) {
-                radiusMenuScrollOffset = targetMenuIndex - maxVisibleMenuItems + 1;
-            }
-        }
-        UIFrameEvent uiEvent;
-        uiEvent.action = UIFrameEvent::Action::REDRAW_ONLY;
-        notifyObservers(&uiEvent);
-        return 1;
-    }
-
-    if (isSelectEvent(event)) {
-        if (uiState == UI_STATE_MAIN_MENU) {
-            handleMainMenuSelect();
-        } else if (uiState == UI_STATE_TARGET_MENU) {
-            handleTargetMenuSelect();
-        } else if (uiState == UI_STATE_RADIUS_MENU) {
-            handleRadiusMenuSelect();
-        }
+        clearAlarm(true);
+        runtime.outsideConsecutiveCount = 0;
+        runtime.timeoutConsecutiveCount = 0;
+        saveState(true);
+        notifyScreenUpdate(UIFrameEvent::Action::REDRAW_ONLY, false);
         return 1;
     }
 
     return 0;
-}
-
-void GeofenceModule::handleMainMenuSelect()
-{
-    switch (menuIndex) {
-    case 0:
-        setUiState(UI_STATE_TARGET_MENU);
-        break;
-    case 1:
-        setUiState(UI_STATE_RADIUS_MENU);
-        break;
-    case 2:
-        if (refreshCenterFromTargetPosition()) {
-            state.armed = true;
-            state.alarmSilenced = false;
-            runtime.timeoutConsecutiveCount = 0;
-            runtime.outsideConsecutiveCount = 0;
-            clearAlarm();
-            saveState(true);
-        }
-        setUiState(UI_STATE_STATUS);
-        break;
-    case 3:
-        disarm();
-        setUiState(UI_STATE_STATUS);
-        break;
-    case 4:
-        setUiState(UI_STATE_STATUS);
-        break;
-    default:
-        break;
-    }
-}
-
-void GeofenceModule::handleTargetMenuSelect()
-{
-    if (targetMenuIndex == 0) {
-        setUiState(UI_STATE_MAIN_MENU);
-        return;
-    }
-
-    const int candidateIndex = targetMenuIndex - 1;
-    if (candidateIndex >= 0 && candidateIndex < static_cast<int>(targetCandidates.size())) {
-        state.targetNode = targetCandidates[candidateIndex];
-        saveState(true);
-    }
-    setUiState(UI_STATE_MAIN_MENU);
-}
-
-void GeofenceModule::handleRadiusMenuSelect()
-{
-    if (targetMenuIndex == 0) {
-        setUiState(UI_STATE_MAIN_MENU);
-        return;
-    }
-
-    const int presetIndex = targetMenuIndex - 1;
-    if (presetIndex >= 0 && presetIndex < radiusPresetCount) {
-        state.radiusMeters = radiusPresetsMeters[presetIndex];
-        saveState(true);
-    }
-    setUiState(UI_STATE_MAIN_MENU);
 }
 
 void GeofenceModule::drawStatusLine(OLEDDisplay *display, int16_t x, int16_t y, int row, const char *label, const char *value)
@@ -560,98 +456,49 @@ void GeofenceModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *stateUi
 
     graphics::drawCommonHeader(display, x, y, "Geofence");
 
-    if (uiState == UI_STATE_STATUS) {
-        drawStatusLine(display, x, y, 0, "Mode", state.armed ? "Armed" : "Disarmed");
+    drawStatusLine(display, x, y, 0, "Mode", state.armed ? "Armed" : "Disarmed");
 
-        char targetStr[24];
-        if (state.targetNode) {
+    char targetStr[24];
+    if (state.targetNode) {
+        const meshtastic_NodeInfoLite *targetNode = nodeDB ? nodeDB->getMeshNode(state.targetNode) : nullptr;
+        const char *targetName = nullptr;
+        if (targetNode && targetNode->has_user) {
+            if (targetNode->user.long_name[0]) {
+                targetName = targetNode->user.long_name;
+            } else if (targetNode->user.short_name[0]) {
+                targetName = targetNode->user.short_name;
+            }
+        }
+
+        if (targetName) {
+            snprintf(targetStr, sizeof(targetStr), "%s", targetName);
+        } else {
             snprintf(targetStr, sizeof(targetStr), "!%08x", state.targetNode);
-        } else {
-            strncpy(targetStr, "none", sizeof(targetStr));
         }
-        drawStatusLine(display, x, y, 1, "Target", targetStr);
-
-        char radiusStr[24];
-        snprintf(radiusStr, sizeof(radiusStr), "%um", state.radiusMeters);
-        drawStatusLine(display, x, y, 2, "Radius", radiusStr);
-
-        char distStr[24];
-        if (runtime.lastDistanceMeters >= 0) {
-            snprintf(distStr, sizeof(distStr), "%dm", runtime.lastDistanceMeters);
-        } else {
-            strncpy(distStr, "n/a", sizeof(distStr));
-        }
-        drawStatusLine(display, x, y, 3, "Distance", distStr);
-
-        char alarmStr[24];
-        if (runtime.alarmActive) {
-            snprintf(alarmStr, sizeof(alarmStr), state.alarmSilenced ? "ALARM (muted)" : "ALARM");
-        } else {
-            strncpy(alarmStr, "ok", sizeof(alarmStr));
-        }
-        drawStatusLine(display, x, y, 4, "Alarm", alarmStr);
-
-        return;
+    } else {
+        strncpy(targetStr, "none", sizeof(targetStr));
     }
+    drawStatusLine(display, x, y, 1, "Target", targetStr);
 
-    if (uiState == UI_STATE_MAIN_MENU) {
-        int startIdx = menuScrollOffset;
-        int endIdx = std::min(startIdx + maxVisibleMenuItems, mainMenuCount);
-        
-        for (int i = startIdx; i < endIdx; ++i) {
-            const int displayRow = i - startIdx;
-            char line[32];
-            snprintf(line, sizeof(line), "%c %s", (i == menuIndex ? '>' : ' '), mainMenuItems[i]);
-            display->drawString(x + 1, y + 12 + (displayRow * FONT_HEIGHT_SMALL), line);
-        }
-        return;
-    }
+    char radiusStr[24];
+    snprintf(radiusStr, sizeof(radiusStr), "%um", state.radiusMeters);
+    drawStatusLine(display, x, y, 2, "Radius", radiusStr);
 
-    if (uiState == UI_STATE_TARGET_MENU) {
-        int startIdx = targetMenuScrollOffset;
-        int itemCount = static_cast<int>(targetCandidates.size()) + 1; // +1 for "Back"
-        int endIdx = std::min(startIdx + maxVisibleMenuItems, itemCount);
-        
-        for (int i = startIdx; i < endIdx; ++i) {
-            const int displayRow = i - startIdx;
-            char line[32];
-            
-            if (i == 0) {
-                // Back option
-                snprintf(line, sizeof(line), "%c Back", (targetMenuIndex == 0 ? '>' : ' '));
-            } else {
-                const int candidateIdx = i - 1;
-                if (candidateIdx < static_cast<int>(targetCandidates.size())) {
-                    snprintf(line, sizeof(line), "%c !%08x", (targetMenuIndex == i ? '>' : ' '), 
-                             targetCandidates[candidateIdx]);
-                }
-            }
-            display->drawString(x + 1, y + 12 + (displayRow * FONT_HEIGHT_SMALL), line);
-        }
-        return;
+    char distStr[24];
+    if (runtime.lastDistanceMeters >= 0) {
+        snprintf(distStr, sizeof(distStr), "%dm", runtime.lastDistanceMeters);
+    } else {
+        strncpy(distStr, "n/a", sizeof(distStr));
     }
+    drawStatusLine(display, x, y, 3, "Distance", distStr);
 
-    if (uiState == UI_STATE_RADIUS_MENU) {
-        int startIdx = radiusMenuScrollOffset;
-        int itemCount = radiusPresetCount + 1; // +1 for "Back"
-        int endIdx = std::min(startIdx + maxVisibleMenuItems, itemCount);
-        
-        for (int i = startIdx; i < endIdx; ++i) {
-            const int displayRow = i - startIdx;
-            char line[32];
-            
-            if (i == 0) {
-                // Back option
-                snprintf(line, sizeof(line), "%c Back", (targetMenuIndex == 0 ? '>' : ' '));
-            } else {
-                const int presetIdx = i - 1;
-                if (presetIdx < radiusPresetCount) {
-                    snprintf(line, sizeof(line), "%c %um", (targetMenuIndex == i ? '>' : ' '), 
-                             radiusPresetsMeters[presetIdx]);
-                }
-            }
-            display->drawString(x + 1, y + 12 + (displayRow * FONT_HEIGHT_SMALL), line);
-        }
+    char alarmStr[24];
+    if (runtime.alarmActive) {
+        const char *alarmLabel = runtime.alarmType == AlarmType::Offline ? "OFFLINE" : "ALARM";
+        snprintf(alarmStr, sizeof(alarmStr), state.alarmSilenced ? "%s (muted)" : "%s", alarmLabel);
+    } else {
+        strncpy(alarmStr, "ok", sizeof(alarmStr));
     }
+    drawStatusLine(display, x, y, 4, "Alarm", alarmStr);
 }
 #endif
