@@ -626,7 +626,8 @@ void setup()
         }
     }
 
-    pmu_found = i2cScanner->exists(ScanI2C::DeviceType::PMU_AXP192_AXP2101);
+    // Preserve PMU detection from power->setup(); scanner can miss 0x34 devices on some boards.
+    pmu_found = pmu_found || i2cScanner->exists(ScanI2C::DeviceType::PMU_AXP192_AXP2101);
 
     auto aqiInfo = i2cScanner->firstAQI();
     aqi_found = aqiInfo.type != ScanI2C::DeviceType::NONE ? aqiInfo.address : ScanI2C::ADDRESS_NONE;

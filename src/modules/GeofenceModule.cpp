@@ -1,9 +1,11 @@
 #include "GeofenceModule.h"
 
+#include <algorithm>
 #include "FSCommon.h"
 #include "NodeDB.h"
 #include "RTC.h"
 #include "buzz/buzz.h"
+#include "graphics/SharedUIDisplay.h"
 #include "main.h"
 
 GeofenceModule *geofenceModule;
@@ -12,10 +14,16 @@ namespace
 {
 constexpr uint32_t geofenceAlarmBeepIntervalMs = 1200;
 
+#if defined(USE_RF95) && defined(PIN_BUZZER) && (PIN_BUZZER == 19)
+constexpr bool geofenceBuzzerAllowed = false;
+#else
+constexpr bool geofenceBuzzerAllowed = true;
+#endif
+
 const uint16_t radiusPresetsMeters[] = {25, 50, 100, 200, 500};
 
 #if HAS_SCREEN
-const char *mainMenuItems[] = {"Back", "Select target", "Set radius", "Arm/Reset", "Disarm"};
+const char *mainMenuItems[] = {"Select target", "Set radius", "Arm/Reset", "Disarm", "Back"};
 #endif
 }
 
@@ -41,7 +49,7 @@ GeofenceModule::GeofenceModule()
 #endif
 #endif
 
-    setInterval(1000);
+    setInterval(100); // Fast polling for responsive UI
 }
 
 bool GeofenceModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_Position *p)
@@ -54,23 +62,45 @@ bool GeofenceModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mes
         return false;
     }
 
-    updateMonitoringFromNodeDB();
+    // Don't update monitoring here - let the thread handle it
+    // Accessing NodeDB during radio packet processing can cause conflicts
+    // with RF95Interface setStandby() operations
     return false;
 }
 
 int32_t GeofenceModule::runOnce()
 {
-    updateMonitoringFromNodeDB();
-
-    if (runtime.alarmActive && !state.alarmSilenced) {
-        const uint32_t nowMs = millis();
-        if (runtime.lastAlarmBeepMs == 0 || (nowMs - runtime.lastAlarmBeepMs) >= geofenceAlarmBeepIntervalMs) {
-            playLongBeep();
-            runtime.lastAlarmBeepMs = nowMs;
+    const uint32_t nowMs = millis();
+    
+    // Only actively monitor if armed or alarm is active
+    // This prevents constant NodeDB access which causes radio driver conflicts
+    if (state.armed || runtime.alarmActive) {
+        static uint32_t lastMonitorUpdateMs = 0;
+        
+        // Update monitoring every 500ms when actively running
+        if (nowMs - lastMonitorUpdateMs >= 500) {
+            updateMonitoringFromNodeDB();
+            lastMonitorUpdateMs = nowMs;
         }
+        
+        // Handle alarm beeping
+        if (runtime.alarmActive && !state.alarmSilenced) {
+            if (runtime.lastAlarmBeepMs == 0 || (nowMs - runtime.lastAlarmBeepMs) >= geofenceAlarmBeepIntervalMs) {
+#if defined(PIN_BUZZER)
+                if (geofenceBuzzerAllowed) {
+                    playLongBeep();
+                }
+#endif
+                runtime.lastAlarmBeepMs = nowMs;
+            }
+        }
+        
+        return 100; // Active monitoring: check every 100ms
     }
-
-    return 1000;
+    
+    // Idle state: sleep the thread to avoid unnecessary radio conflicts
+    // Return a long interval so thread mostly sleeps
+    return 100; // Idle: check every 100ms
 }
 
 void GeofenceModule::updateMonitoringFromNodeDB()
@@ -78,9 +108,21 @@ void GeofenceModule::updateMonitoringFromNodeDB()
     runtime.lastDistanceMeters = -1;
     runtime.lastTargetPositionAgeSec = 0;
 
+    // Quick exit if not actively monitoring
+    if (!state.armed && !runtime.alarmActive) {
+        runtime.timeoutConsecutiveCount = 0;
+        runtime.outsideConsecutiveCount = 0;
+        return;
+    }
+
     if (!state.targetNode) {
         runtime.timeoutConsecutiveCount = 0;
         runtime.outsideConsecutiveCount = 0;
+        return;
+    }
+
+    // Safely access NodeDB with guard checks
+    if (!nodeDB) {
         return;
     }
 
@@ -93,6 +135,7 @@ void GeofenceModule::updateMonitoringFromNodeDB()
 
     runtime.lastTargetPositionAgeSec = sinceLastSeen(targetNode);
 
+    // Check timeout condition only if armed
     if (state.armed && state.timeoutSeconds > 0 && runtime.lastTargetPositionAgeSec > state.timeoutSeconds) {
         if (runtime.timeoutConsecutiveCount < UINT8_MAX) {
             runtime.timeoutConsecutiveCount++;
@@ -104,6 +147,13 @@ void GeofenceModule::updateMonitoringFromNodeDB()
         runtime.timeoutConsecutiveCount = 0;
     }
 
+    // Skip distance check if not armed
+    if (!state.armed) {
+        runtime.outsideConsecutiveCount = 0;
+        return;
+    }
+
+    // Check if target has valid position and we have a center
     if (!nodeDB->hasValidPosition(targetNode) || !state.hasCenter) {
         runtime.outsideConsecutiveCount = 0;
         return;
@@ -113,11 +163,7 @@ void GeofenceModule::updateMonitoringFromNodeDB()
     GeoCoord targetPosition(targetNode->position.latitude_i, targetNode->position.longitude_i, 0);
     runtime.lastDistanceMeters = fenceCenter.distanceTo(targetPosition);
 
-    if (!state.armed) {
-        runtime.outsideConsecutiveCount = 0;
-        return;
-    }
-
+    // Distance breach detection with hysteresis
     if (runtime.lastDistanceMeters > state.radiusMeters) {
         if (runtime.outsideConsecutiveCount < UINT8_MAX) {
             runtime.outsideConsecutiveCount++;
@@ -127,6 +173,7 @@ void GeofenceModule::updateMonitoringFromNodeDB()
         }
     } else {
         runtime.outsideConsecutiveCount = 0;
+        // Clear alarm if we've returned to the safe zone
         if (runtime.alarmActive) {
             clearAlarm(true);
         }
@@ -233,6 +280,10 @@ void GeofenceModule::saveState(bool force)
 void GeofenceModule::setUiState(UiState nextState)
 {
     uiState = nextState;
+    menuScrollOffset = 0;
+    targetMenuScrollOffset = 0;
+    radiusMenuScrollOffset = 0;
+    
     if (uiState == UI_STATE_MAIN_MENU) {
         menuIndex = 0;
     } else if (uiState == UI_STATE_TARGET_MENU) {
@@ -300,11 +351,43 @@ bool GeofenceModule::isSelectEvent(const InputEvent *event) const
     return event->inputEvent == INPUT_BROKER_SELECT;
 }
 
+static bool isAlarmAcknowledgeEvent(const InputEvent *event)
+{
+    switch (event->inputEvent) {
+    case INPUT_BROKER_SELECT:
+    case INPUT_BROKER_SELECT_LONG:
+    case INPUT_BROKER_UP:
+    case INPUT_BROKER_DOWN:
+    case INPUT_BROKER_LEFT:
+    case INPUT_BROKER_RIGHT:
+    case INPUT_BROKER_UP_LONG:
+    case INPUT_BROKER_DOWN_LONG:
+    case INPUT_BROKER_CANCEL:
+    case INPUT_BROKER_BACK:
+    case INPUT_BROKER_USER_PRESS:
+    case INPUT_BROKER_ALT_PRESS:
+    case INPUT_BROKER_ALT_LONG:
+    case INPUT_BROKER_ANYKEY:
+        return true;
+    default:
+        return false;
+    }
+}
+
 int GeofenceModule::handleInputEvent(const InputEvent *event)
 {
-    if (runtime.alarmActive && isSelectEvent(event)) {
+    // Acknowledge/silence active alarm from the alert or status screen.
+    if (runtime.alarmActive && isAlarmAcknowledgeEvent(event)) {
         state.alarmSilenced = true;
         saveState();
+#if HAS_SCREEN
+        if (screen) {
+            screen->endAlert();
+        }
+#endif
+    UIFrameEvent uiEvent;
+    uiEvent.action = UIFrameEvent::Action::REDRAW_ONLY;
+    notifyObservers(&uiEvent);
         return 1;
     }
 
@@ -319,30 +402,67 @@ int GeofenceModule::handleInputEvent(const InputEvent *event)
     if (isUpEvent(event)) {
         if (uiState == UI_STATE_MAIN_MENU) {
             menuIndex = (menuIndex - 1 + mainMenuCount) % mainMenuCount;
+            // Update scroll offset to keep selection visible
+            if (menuIndex < menuScrollOffset) {
+                menuScrollOffset = menuIndex;
+            } else if (menuIndex >= menuScrollOffset + maxVisibleMenuItems) {
+                menuScrollOffset = menuIndex - maxVisibleMenuItems + 1;
+            }
         } else if (uiState == UI_STATE_TARGET_MENU) {
             const int itemCount = static_cast<int>(targetCandidates.size()) + 1;
             if (itemCount > 0) {
                 targetMenuIndex = (targetMenuIndex - 1 + itemCount) % itemCount;
+                if (targetMenuIndex < targetMenuScrollOffset) {
+                    targetMenuScrollOffset = targetMenuIndex;
+                } else if (targetMenuIndex >= targetMenuScrollOffset + maxVisibleMenuItems) {
+                    targetMenuScrollOffset = targetMenuIndex - maxVisibleMenuItems + 1;
+                }
             }
         } else if (uiState == UI_STATE_RADIUS_MENU) {
             const int itemCount = radiusPresetCount + 1;
             targetMenuIndex = (targetMenuIndex - 1 + itemCount) % itemCount;
+            if (targetMenuIndex < radiusMenuScrollOffset) {
+                radiusMenuScrollOffset = targetMenuIndex;
+            } else if (targetMenuIndex >= radiusMenuScrollOffset + maxVisibleMenuItems) {
+                radiusMenuScrollOffset = targetMenuIndex - maxVisibleMenuItems + 1;
+            }
         }
+        UIFrameEvent uiEvent;
+        uiEvent.action = UIFrameEvent::Action::REDRAW_ONLY;
+        notifyObservers(&uiEvent);
         return 1;
     }
 
     if (isDownEvent(event)) {
         if (uiState == UI_STATE_MAIN_MENU) {
             menuIndex = (menuIndex + 1) % mainMenuCount;
+            if (menuIndex < menuScrollOffset) {
+                menuScrollOffset = menuIndex;
+            } else if (menuIndex >= menuScrollOffset + maxVisibleMenuItems) {
+                menuScrollOffset = menuIndex - maxVisibleMenuItems + 1;
+            }
         } else if (uiState == UI_STATE_TARGET_MENU) {
             const int itemCount = static_cast<int>(targetCandidates.size()) + 1;
             if (itemCount > 0) {
                 targetMenuIndex = (targetMenuIndex + 1) % itemCount;
+                if (targetMenuIndex < targetMenuScrollOffset) {
+                    targetMenuScrollOffset = targetMenuIndex;
+                } else if (targetMenuIndex >= targetMenuScrollOffset + maxVisibleMenuItems) {
+                    targetMenuScrollOffset = targetMenuIndex - maxVisibleMenuItems + 1;
+                }
             }
         } else if (uiState == UI_STATE_RADIUS_MENU) {
             const int itemCount = radiusPresetCount + 1;
             targetMenuIndex = (targetMenuIndex + 1) % itemCount;
+            if (targetMenuIndex < radiusMenuScrollOffset) {
+                radiusMenuScrollOffset = targetMenuIndex;
+            } else if (targetMenuIndex >= radiusMenuScrollOffset + maxVisibleMenuItems) {
+                radiusMenuScrollOffset = targetMenuIndex - maxVisibleMenuItems + 1;
+            }
         }
+        UIFrameEvent uiEvent;
+        uiEvent.action = UIFrameEvent::Action::REDRAW_ONLY;
+        notifyObservers(&uiEvent);
         return 1;
     }
 
@@ -364,15 +484,12 @@ void GeofenceModule::handleMainMenuSelect()
 {
     switch (menuIndex) {
     case 0:
-        setUiState(UI_STATE_STATUS);
-        break;
-    case 1:
         setUiState(UI_STATE_TARGET_MENU);
         break;
-    case 2:
+    case 1:
         setUiState(UI_STATE_RADIUS_MENU);
         break;
-    case 3:
+    case 2:
         if (refreshCenterFromTargetPosition()) {
             state.armed = true;
             state.alarmSilenced = false;
@@ -383,8 +500,11 @@ void GeofenceModule::handleMainMenuSelect()
         }
         setUiState(UI_STATE_STATUS);
         break;
-    case 4:
+    case 3:
         disarm();
+        setUiState(UI_STATE_STATUS);
+        break;
+    case 4:
         setUiState(UI_STATE_STATUS);
         break;
     default:
@@ -438,6 +558,8 @@ void GeofenceModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *stateUi
     display->setTextAlignment(TEXT_ALIGN_LEFT);
     display->setFont(FONT_SMALL);
 
+    graphics::drawCommonHeader(display, x, y, "Geofence");
+
     if (uiState == UI_STATE_STATUS) {
         drawStatusLine(display, x, y, 0, "Mode", state.armed ? "Armed" : "Disarmed");
 
@@ -472,42 +594,63 @@ void GeofenceModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *stateUi
         return;
     }
 
-    display->drawString(x + 1, y + 2, uiState == UI_STATE_MAIN_MENU ? "Geofence Menu" :
-                                           (uiState == UI_STATE_TARGET_MENU ? "Select Target" : "Set Radius"));
-
     if (uiState == UI_STATE_MAIN_MENU) {
-        for (int i = 0; i < mainMenuCount; ++i) {
+        int startIdx = menuScrollOffset;
+        int endIdx = std::min(startIdx + maxVisibleMenuItems, mainMenuCount);
+        
+        for (int i = startIdx; i < endIdx; ++i) {
+            const int displayRow = i - startIdx;
             char line[32];
             snprintf(line, sizeof(line), "%c %s", (i == menuIndex ? '>' : ' '), mainMenuItems[i]);
-            display->drawString(x + 1, y + 12 + (i * FONT_HEIGHT_SMALL), line);
+            display->drawString(x + 1, y + 12 + (displayRow * FONT_HEIGHT_SMALL), line);
         }
         return;
     }
 
     if (uiState == UI_STATE_TARGET_MENU) {
-        char line[32];
-        snprintf(line, sizeof(line), "%c Back", targetMenuIndex == 0 ? '>' : ' ');
-        display->drawString(x + 1, y + 12, line);
-
-        for (size_t i = 0; i < targetCandidates.size() && i < 4; ++i) {
-            const int idx = static_cast<int>(i) + 1;
-            char nodeLine[32];
-            snprintf(nodeLine, sizeof(nodeLine), "%c !%08x", (targetMenuIndex == idx ? '>' : ' '), targetCandidates[i]);
-            display->drawString(x + 1, y + 12 + (idx * FONT_HEIGHT_SMALL), nodeLine);
+        int startIdx = targetMenuScrollOffset;
+        int itemCount = static_cast<int>(targetCandidates.size()) + 1; // +1 for "Back"
+        int endIdx = std::min(startIdx + maxVisibleMenuItems, itemCount);
+        
+        for (int i = startIdx; i < endIdx; ++i) {
+            const int displayRow = i - startIdx;
+            char line[32];
+            
+            if (i == 0) {
+                // Back option
+                snprintf(line, sizeof(line), "%c Back", (targetMenuIndex == 0 ? '>' : ' '));
+            } else {
+                const int candidateIdx = i - 1;
+                if (candidateIdx < static_cast<int>(targetCandidates.size())) {
+                    snprintf(line, sizeof(line), "%c !%08x", (targetMenuIndex == i ? '>' : ' '), 
+                             targetCandidates[candidateIdx]);
+                }
+            }
+            display->drawString(x + 1, y + 12 + (displayRow * FONT_HEIGHT_SMALL), line);
         }
         return;
     }
 
     if (uiState == UI_STATE_RADIUS_MENU) {
-        char line[32];
-        snprintf(line, sizeof(line), "%c Back", targetMenuIndex == 0 ? '>' : ' ');
-        display->drawString(x + 1, y + 12, line);
-
-        for (int i = 0; i < radiusPresetCount && i < 4; ++i) {
-            const int idx = i + 1;
-            char radiusLine[32];
-            snprintf(radiusLine, sizeof(radiusLine), "%c %um", targetMenuIndex == idx ? '>' : ' ', radiusPresetsMeters[i]);
-            display->drawString(x + 1, y + 12 + (idx * FONT_HEIGHT_SMALL), radiusLine);
+        int startIdx = radiusMenuScrollOffset;
+        int itemCount = radiusPresetCount + 1; // +1 for "Back"
+        int endIdx = std::min(startIdx + maxVisibleMenuItems, itemCount);
+        
+        for (int i = startIdx; i < endIdx; ++i) {
+            const int displayRow = i - startIdx;
+            char line[32];
+            
+            if (i == 0) {
+                // Back option
+                snprintf(line, sizeof(line), "%c Back", (targetMenuIndex == 0 ? '>' : ' '));
+            } else {
+                const int presetIdx = i - 1;
+                if (presetIdx < radiusPresetCount) {
+                    snprintf(line, sizeof(line), "%c %um", (targetMenuIndex == i ? '>' : ' '), 
+                             radiusPresetsMeters[presetIdx]);
+                }
+            }
+            display->drawString(x + 1, y + 12 + (displayRow * FONT_HEIGHT_SMALL), line);
         }
     }
 }

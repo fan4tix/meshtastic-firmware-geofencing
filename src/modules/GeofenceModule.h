@@ -76,10 +76,14 @@ class GeofenceModule : public ProtobufModule<meshtastic_Position>, private concu
 
     static constexpr int mainMenuCount = 5;
     static constexpr int radiusPresetCount = 5;
+    static constexpr int maxVisibleMenuItems = 4;
 
     UiState uiState = UI_STATE_STATUS;
     int menuIndex = 0;
+    int menuScrollOffset = 0;
     int targetMenuIndex = 0;
+    int targetMenuScrollOffset = 0;
+    int radiusMenuScrollOffset = 0;
     int selectedNodeIndex = 0;
     std::vector<uint32_t> targetCandidates;
 
